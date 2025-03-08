@@ -1,4 +1,6 @@
 // server/src/index.ts
+// Update your server code with these CORS fixes and debugging improvements
+
 import express from 'express';
 import http from 'http';
 import { Server as SocketIOServer } from 'socket.io';
@@ -6,32 +8,55 @@ import { v4 as uuidv4 } from 'uuid';
 import * as dotenv from 'dotenv';
 import cors from 'cors';
 import { GameWorld } from './game/GameWorld';
-import { GameEvent, GameEventType, Player} from './types/Player';
+import { GameEvent, GameEventType, Player } from './types/Player';
 import { logger } from './utils/logger';
 import { validatePlayerMovement } from './utils/validation';
 
 // Load environment variables
 dotenv.config();
 
-// Configuration
+// Configuration - IMPORTANT: Updated to allow all origins or specify your actual client origin
 const PORT = process.env.PORT || 3001;
-const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:3000';
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173'; // Update to match your client!
 const MAX_PLAYERS_PER_WORLD = parseInt(process.env.MAX_PLAYERS_PER_WORLD || '100');
 
-// Set up Express app
+// Set up Express app with proper CORS
 const app = express();
-app.use(cors({ origin: CORS_ORIGIN }));
+
+// Configure CORS for Express routes
+app.use(cors({
+  origin: '*', // Allow all origins for testing, or set to your specific client origin
+  methods: ['GET', 'POST'],
+  credentials: true
+}));
+
 app.use(express.json());
 
 // Create HTTP server
 const server = http.createServer(app);
 
-// Create Socket.IO server
+// Create Socket.IO server with proper CORS configuration
 const io = new SocketIOServer(server, {
   cors: {
-    origin: CORS_ORIGIN,
-    methods: ['GET', 'POST']
-  }
+    origin: '*', // Allow all origins for testing, or set to your specific client origin
+    methods: ['GET', 'POST'],
+    credentials: true
+  },
+  // Additional options for debugging
+  connectTimeout: 30000,
+  pingTimeout: 30000,
+  pingInterval: 10000
+});
+
+// Debug middleware for Socket.IO
+io.use((socket, next) => {
+  logger.info(`New connection attempt: ${socket.id} from ${socket.handshake.address}`);
+  
+  // Debug origin info
+  logger.info(`Origin: ${socket.handshake.headers.origin}`);
+  logger.info(`Headers: ${JSON.stringify(socket.handshake.headers)}`);
+  
+  next();
 });
 
 // Game worlds map (support for multiple worlds/instances)
@@ -53,17 +78,20 @@ io.on('connection', (socket) => {
   let currentPlayer: Player | null = null;
   let currentWorldId: string | null = null;
 
-  logger.info(`New connection: ${socket.id}`);
+  logger.info(`New connection established: ${socket.id}`);
 
   // Handle player join request
   socket.on('player:join', ({ username, worldId = 'default' }) => {
     try {
+      logger.info(`Player ${username} is attempting to join world ${worldId}`);
+      
       // Get or create the requested game world
       const gameWorld = getOrCreateWorld(worldId);
       currentWorldId = worldId;
 
       // Check if world is full
       if (gameWorld.isFull()) {
+        logger.warn(`World ${worldId} is full, rejecting player ${username}`);
         socket.emit('error', { message: 'World is full' });
         return;
       }
@@ -85,6 +113,8 @@ io.on('connection', (socket) => {
       // Join the socket to the world's room
       socket.join(worldId);
 
+      logger.info(`Player ${currentPlayer.username} (${playerId}) joined world ${worldId} at position (${currentPlayer.position.x}, ${currentPlayer.position.y})`);
+
       // Send join confirmation to the player
       socket.emit('player:joined', {
         player: currentPlayer,
@@ -94,6 +124,8 @@ io.on('connection', (socket) => {
 
       // Send existing players to the new player
       const existingPlayers = gameWorld.getPlayers().filter(p => p.id !== playerId);
+      logger.info(`Sending ${existingPlayers.length} existing players to ${username}`);
+      
       if (existingPlayers.length > 0) {
         socket.emit('world:players', {
           players: existingPlayers,
@@ -103,19 +135,21 @@ io.on('connection', (socket) => {
 
       // Send world chunks around player
       const chunks = gameWorld.getChunksNearPosition(currentPlayer.position);
+      logger.info(`Sending ${chunks.length} chunks to ${username}`);
+      
       socket.emit('world:chunks', {
         chunks,
         timestamp: Date.now()
       });
 
       // Broadcast the new player to all other players
+      logger.info(`Broadcasting new player ${username} to other players in world ${worldId}`);
+      
       socket.to(worldId).emit('player:joined', {
         player: currentPlayer,
         worldId,
         timestamp: Date.now()
       });
-
-      logger.info(`Player ${currentPlayer.username} (${playerId}) joined world ${worldId}`);
     } catch (error) {
       logger.error('Error in player:join handler', error);
       socket.emit('error', { message: 'Failed to join game' });
@@ -124,16 +158,24 @@ io.on('connection', (socket) => {
 
   // Handle player movement
   socket.on('player:move', (data) => {
-    if (!currentPlayer || !currentWorldId) return;
+    if (!currentPlayer || !currentWorldId) {
+      logger.warn(`Received movement from unauthenticated player: ${socket.id}`);
+      return;
+    }
 
     try {
       // Validate the movement data
       if (!validatePlayerMovement(data)) {
-        logger.warn(`Invalid movement data from ${currentPlayer.id}`);
+        logger.warn(`Invalid movement data from ${currentPlayer.id}: ${JSON.stringify(data)}`);
         return;
       }
 
       const { position, direction, isMoving } = data;
+
+      // Debug occasional position updates
+      if (Math.random() < 0.01) {
+        logger.debug(`Player ${currentPlayer.username} moved to (${position.x}, ${position.y})`);
+      }
 
       // Update player in world
       const gameWorld = gameWorlds.get(currentWorldId)!;
@@ -176,11 +218,17 @@ io.on('connection', (socket) => {
         }
       };
 
+      // Debug occasional broadcasts
+      if (Math.random() < 0.01) {
+        logger.debug(`Broadcasting movement of ${currentPlayer.username} to ${gameWorld.getPlayerCount() - 1} other players`);
+      }
+
       socket.to(currentWorldId).emit('player:move', moveEvent);
 
       // Check if player entered new chunks and send them if needed
       const newChunks = gameWorld.getNewChunksForPlayer(currentPlayer);
       if (newChunks.length > 0) {
+        logger.debug(`Sending ${newChunks.length} new chunks to ${currentPlayer.username}`);
         socket.emit('world:chunks', {
           chunks: newChunks,
           timestamp: Date.now()
@@ -193,12 +241,20 @@ io.on('connection', (socket) => {
 
   // Handle chat messages
   socket.on('chat:message', (message) => {
-    if (!currentPlayer || !currentWorldId) return;
+    if (!currentPlayer || !currentWorldId) {
+      logger.warn(`Received chat from unauthenticated client: ${socket.id}`);
+      return;
+    }
 
     try {
       // Basic message validation
       const trimmedMessage = message.trim();
-      if (!trimmedMessage || trimmedMessage.length > 500) return;
+      if (!trimmedMessage || trimmedMessage.length > 500) {
+        logger.warn(`Invalid chat message from ${currentPlayer.id}: length=${message.length}`);
+        return;
+      }
+
+      logger.info(`Chat from ${currentPlayer.username}: ${trimmedMessage.substring(0, 50)}${trimmedMessage.length > 50 ? '...' : ''}`);
 
       const chatEvent = {
         type: GameEventType.CHAT_MESSAGE,
@@ -212,8 +268,6 @@ io.on('connection', (socket) => {
 
       // Broadcast to all players in the world
       io.to(currentWorldId).emit('chat:message', chatEvent);
-      
-      logger.debug(`Chat from ${currentPlayer.username}: ${trimmedMessage.substring(0, 20)}${trimmedMessage.length > 20 ? '...' : ''}`);
     } catch (error) {
       logger.error('Error in chat:message handler', error);
     }
@@ -225,6 +279,8 @@ io.on('connection', (socket) => {
       const gameWorld = gameWorlds.get(currentWorldId);
       
       if (gameWorld) {
+        logger.info(`Player ${currentPlayer.username} (${currentPlayer.id}) left world ${currentWorldId}`);
+        
         // Remove player from world
         gameWorld.removePlayer(currentPlayer.id);
         
@@ -233,8 +289,6 @@ io.on('connection', (socket) => {
           playerId: currentPlayer.id,
           timestamp: Date.now()
         });
-        
-        logger.info(`Player ${currentPlayer.username} (${currentPlayer.id}) left world ${currentWorldId}`);
         
         // Clean up empty worlds after a delay
         if (gameWorld.getPlayerCount() === 0) {
@@ -255,18 +309,48 @@ io.on('connection', (socket) => {
 
 // Health check endpoint
 app.get('/health', (req, res) => {
+  // Count total players across all worlds
+  const totalPlayers = Array.from(gameWorlds.values()).reduce(
+    (acc, world) => acc + world.getPlayerCount(), 0
+  );
+  
   res.status(200).json({
     status: 'ok',
     uptime: process.uptime(),
     worldCount: gameWorlds.size,
-    playerCount: Array.from(gameWorlds.values()).reduce((acc, world) => acc + world.getPlayerCount(), 0)
+    playerCount: totalPlayers,
+    worlds: Array.from(gameWorlds.entries()).map(([id, world]) => ({
+      id,
+      players: world.getPlayerCount()
+    }))
+  });
+});
+
+// Debug endpoint to get current state
+app.get('/debug', (req, res) => {
+  const worldData = Array.from(gameWorlds.entries()).map(([id, world]) => ({
+    id,
+    playerCount: world.getPlayerCount(),
+    players: world.getPlayers().map(p => ({
+      id: p.id,
+      username: p.username,
+      position: p.position,
+      direction: p.direction,
+      isMoving: p.isMoving,
+      lastUpdate: new Date(p.lastUpdate).toISOString()
+    }))
+  }));
+  
+  res.status(200).json({
+    socketConnections: io.engine.clientsCount,
+    worlds: worldData
   });
 });
 
 // Start server
 server.listen(PORT, () => {
   logger.info(`Server listening on port ${PORT}`);
-  logger.info(`CORS origin set to ${CORS_ORIGIN}`);
+  logger.info(`CORS origin set to ${CORS_ORIGIN} (actual config set to allow all origins for testing)`);
 });
 
 // Handle graceful shutdown
